@@ -1,3 +1,4 @@
+# Ostateczna, stabilna wersja pliku chart_window.py
 import sys
 import os
 import configparser
@@ -7,11 +8,12 @@ import ccxt
 import pandas as pd
 import pandas_ta as ta
 import pyqtgraph as pg
+import numpy as np
 from PySide6.QtWidgets import (QMainWindow, QVBoxLayout, QWidget,
                              QComboBox, QGridLayout, QLabel, QListWidget,
                              QPushButton, QHBoxLayout, QGroupBox, QApplication,
                              QMessageBox, QListWidgetItem, QFormLayout,
-                             QSpinBox, QStackedWidget, QCheckBox)
+                             QSpinBox, QStackedWidget, QCheckBox, QScrollArea)
 from PySide6.QtCore import QThread, Signal, Qt, QRectF, QPointF, QTimer
 from PySide6.QtGui import QPainter, QPen
 
@@ -24,19 +26,21 @@ DEFAULT_RSI_LENGTH = 14
 DEFAULT_MACD_FAST = 12
 DEFAULT_MACD_SLOW = 26
 DEFAULT_MACD_SIGNAL = 9
+DEFAULT_REFRESH_MINUTES = 5
 
+# --- STABILNA, POPRAWIONA KLASA DO RYSOWANIA ŚWIEC ---
 class CandlestickItem(pg.GraphicsObject):
     def __init__(self, data):
-        super().__init__()
-        self.data = data  # data to lista słowników
+        pg.GraphicsObject.__init__(self)
+        self.data = data  # data = list of dicts with 'x', 'o', 'h', 'l', 'c'
         self.generatePicture()
 
     def generatePicture(self):
         self.picture = pg.QtGui.QPicture()
-        p = QPainter(self.picture)
-        if not self.data: return
+        p = pg.QtGui.QPainter(self.picture)
 
         if len(self.data) > 1:
+            # Poprawione obliczanie szerokości świecy
             w = (self.data[1]['x'] - self.data[0]['x']) * 0.4
         else:
             w = 1.0
@@ -45,7 +49,10 @@ class CandlestickItem(pg.GraphicsObject):
             t, open_val, high_val, low_val, close_val = d['x'], d['open'], d['high'], d['low'], d['close']
             p.setPen(pg.mkPen('k'))
             p.drawLine(QPointF(t, low_val), QPointF(t, high_val))
-            p.setBrush(pg.mkBrush('g') if open_val < close_val else pg.mkBrush('r'))
+            if open_val > close_val:
+                p.setBrush(pg.mkBrush('r'))
+            else:
+                p.setBrush(pg.mkBrush('g'))
             p.drawRect(QRectF(t - w, open_val, w * 2, close_val - open_val))
         p.end()
 
@@ -54,10 +61,13 @@ class CandlestickItem(pg.GraphicsObject):
 
     def boundingRect(self):
         if not self.data: return QRectF()
-        x_min, x_max = self.data[0]['x'], self.data[-1]['x']
+        # Poprawione obliczanie granic
+        x_min = self.data[0]['x']
+        x_max = self.data[-1]['x']
         y_min = min(d['low'] for d in self.data)
         y_max = max(d['high'] for d in self.data)
         return QRectF(x_min, y_min, x_max - x_min, y_max - y_min)
+
 
 class FetchChartMarketsThread(QThread):
     markets_fetched_signal = Signal(list); error_signal = Signal(str); finished_signal = Signal()
@@ -85,33 +95,25 @@ class FetchChartDataThread(QThread):
         self.chart_widget = chart_widget
     def run(self):
         try:
-            retries = 3; ohlcv = []; last_exception = None
-            for attempt in range(retries):
-                try:
-                    ohlcv = self.exchange.fetch_ohlcv(self.pair_symbol, timeframe=self.timeframe, limit=300)
-                    if ohlcv: break
-                    time.sleep(0.5)
-                except Exception as e:
-                    last_exception = e
-                    if attempt == retries - 1: raise e
-                    time.sleep(0.5)
+            ohlcv = self.exchange.fetch_ohlcv(self.pair_symbol, timeframe=self.timeframe, limit=300)
             if not ohlcv:
-                if last_exception: raise last_exception
-                raise ccxt.NetworkError(f"Giełda nie zwróciła danych dla {self.pair_symbol} na {self.timeframe} po {retries} próbach.")
+                raise ccxt.NetworkError(f"Giełda nie zwróciła danych dla {self.pair_symbol} na {self.timeframe}.")
 
             df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
             df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms'); df.set_index('timestamp', inplace=True)
+
             if self.indicator_name == "Williams %R":
                 wpr_p, ema_p = self.indicator_params.get('wpr_period'), self.indicator_params.get('ema_period')
                 wpr_col = f'WILLR_{wpr_p}'; df.ta.willr(length=wpr_p, append=True)
-                if wpr_col in df: df[f'WPR_EMA_{ema_p}'] = ta.ema(df[wpr_col], length=ema_p)
+                if wpr_col in df and df[wpr_col].notna().any(): df[f'WPR_EMA_{ema_p}'] = ta.ema(df[wpr_col], length=ema_p)
             elif self.indicator_name == "RSI": df.ta.rsi(length=self.indicator_params.get('rsi_period'), append=True)
             elif self.indicator_name == "MACD":
                 fast_p, slow_p, signal_p = self.indicator_params.get('fast'), self.indicator_params.get('slow'), self.indicator_params.get('signal')
                 df.ta.macd(fast=fast_p, slow=slow_p, signal=signal_p, append=True)
+
             self.data_ready_signal.emit(df, self.chart_widget)
         except Exception as e:
-            error_message = f"Błąd danych dla {self.pair_symbol} ({self.timeframe}): {str(e)}"
+            error_message = f"Błąd w wątku dla {self.pair_symbol} ({self.timeframe}): {str(e)}"
             self.error_signal.emit(error_message, self.chart_widget)
         finally:
             self.finished_signal.emit(self)
@@ -213,10 +215,17 @@ class SingleChartWidget(QWidget):
         self.plot_widget.addItem(self.v_line, ignoreBounds=True); self.plot_widget.addItem(self.h_line, ignoreBounds=True)
         self.indicator_widget.addItem(self.v_line_indicator, ignoreBounds=True)
         self.plot_widget.addItem(self.measure_line); self.plot_widget.addItem(self.measure_text)
-        candlestick_data = [{'x': d.timestamp(), 'open': o, 'high': h, 'low': l, 'close': c} for d, o, h, l, c in zip(df.index, df['open'], df['high'], df['low'], df['close'])]
-        if candlestick_data:
+
+        if not df.empty:
+            candlestick_data = []
+            for d_idx, row in df.iterrows():
+                # Przekształcanie timestampu na sekundy
+                timestamp = d_idx.timestamp()
+                candlestick_data.append({'x': timestamp, 'open': row['open'], 'high': row['high'], 'low': row['low'], 'close': row['close']})
+
             item = CandlestickItem(candlestick_data)
             self.plot_widget.addItem(item)
+
         self.redraw_indicator(); self.plot_widget.autoRange(); self.indicator_widget.autoRange()
     def redraw_indicator(self):
         self.indicator_widget.clear(); self.indicator_widget.addItem(self.v_line_indicator, ignoreBounds=True)
@@ -224,12 +233,12 @@ class SingleChartWidget(QWidget):
         indicator_name = self.current_indicator_name; timestamps = self.data_frame.index.astype('int64') // 10**9
         if indicator_name == "Williams %R":
             wpr_col, ema_col = next((c for c in self.data_frame if c.startswith('WILLR_')), None), next((c for c in self.data_frame if c.startswith('WPR_EMA_')), None)
-            if wpr_col: self.indicator_widget.plot(x=timestamps, y=self.data_frame[wpr_col], pen='b', name="W%R")
-            if ema_col: self.indicator_widget.plot(x=timestamps, y=self.data_frame[ema_col], pen=pg.mkPen('orange', width=2), name="EMA on W%R")
+            if wpr_col is not None: self.indicator_widget.plot(x=timestamps, y=self.data_frame[wpr_col], pen='b', name="W%R")
+            if ema_col is not None: self.indicator_widget.plot(x=timestamps, y=self.data_frame[ema_col], pen=pg.mkPen('orange', width=2), name="EMA on W%R")
             self.indicator_widget.addLine(y=-20, pen=pg.mkPen('r', style=Qt.DashLine)); self.indicator_widget.addLine(y=-80, pen=pg.mkPen('g', style=Qt.DashLine))
         elif indicator_name == "RSI":
             rsi_col = next((c for c in self.data_frame if c.startswith('RSI_')), None)
-            if rsi_col: self.indicator_widget.plot(x=timestamps, y=self.data_frame[rsi_col], pen='g', name="RSI"); self.indicator_widget.addLine(y=70, pen=pg.mkPen('r', style=Qt.DashLine)); self.indicator_widget.addLine(y=30, pen=pg.mkPen('g', style=Qt.DashLine))
+            if rsi_col is not None: self.indicator_widget.plot(x=timestamps, y=self.data_frame[rsi_col], pen='g', name="RSI"); self.indicator_widget.addLine(y=70, pen=pg.mkPen('r', style=Qt.DashLine)); self.indicator_widget.addLine(y=30, pen=pg.mkPen('g', style=Qt.DashLine))
         elif indicator_name == "MACD":
             macd_col, macdh_col, macds_col = next((c for c in self.data_frame if c.startswith('MACD_')), None), next((c for c in self.data_frame if c.startswith('MACDh_')), None), next((c for c in self.data_frame if c.startswith('MACDs_')), None)
             if all([macd_col, macdh_col, macds_col]):
@@ -239,9 +248,15 @@ class SingleChartWidget(QWidget):
 
 class MultiChartWindow(QMainWindow):
     def __init__(self, exchange_options, config_path, parent=None):
-        super().__init__(parent); self.exchange_options = exchange_options; self.config_path = config_path
+        super().__init__(parent)
+        self.exchange_options = exchange_options; self.config_path = config_path
         self.setWindowTitle("Okno Analizy Wykresów"); self.setGeometry(150, 150, 1400, 800)
         self.maximized_chart = None; self.current_pair = ""
+        self.is_loading = False
+
+        self.refresh_timer = QTimer(self)
+        self.refresh_timer.timeout.connect(self.trigger_chart_updates)
+
         self.setup_ui()
         self.fetch_markets_thread = None; self.chart_data_threads = {}
         self.load_settings(); self.on_global_indicator_changed()
@@ -250,7 +265,13 @@ class MultiChartWindow(QMainWindow):
         self.central_widget = QWidget(); self.setCentralWidget(self.central_widget); self.main_layout = QHBoxLayout(self.central_widget)
         self.setup_sidebar(); self.setup_charts_grid()
     def setup_sidebar(self):
-        self.sidebar_widget = QWidget(); self.sidebar_layout = QVBoxLayout(self.sidebar_widget); self.sidebar_widget.setFixedWidth(300)
+        self.sidebar_scroll_area = QScrollArea()
+        self.sidebar_scroll_area.setWidgetResizable(True)
+        self.sidebar_scroll_area.setFixedWidth(320)
+
+        self.sidebar_widget = QWidget()
+        self.sidebar_layout = QVBoxLayout(self.sidebar_widget)
+
         self.sidebar_layout.addWidget(QLabel("<b>Panel Kontrolny</b>")); self.sidebar_layout.addWidget(QLabel("Giełda:")); self.chart_exchange_combo = QComboBox()
         if self.exchange_options: self.chart_exchange_combo.addItems(self.exchange_options.keys())
         self.chart_exchange_combo.currentTextChanged.connect(self.on_exchange_changed); self.sidebar_layout.addWidget(self.chart_exchange_combo)
@@ -284,8 +305,26 @@ class MultiChartWindow(QMainWindow):
 
         self.sidebar_layout.addStretch()
 
-        self.load_charts_button = QPushButton("Wczytaj Wykresy dla wybranej pary"); self.load_charts_button.clicked.connect(self.trigger_chart_updates)
-        self.sidebar_layout.addWidget(self.load_charts_button); self.main_layout.addWidget(self.sidebar_widget)
+        refresh_group = QGroupBox("Automatyczne odświeżanie")
+        refresh_layout = QFormLayout(refresh_group)
+        self.auto_refresh_checkbox = QCheckBox("Włącz auto-odświeżanie")
+        self.refresh_interval_spinbox = QSpinBox()
+        self.refresh_interval_spinbox.setRange(1, 120)
+        self.refresh_interval_spinbox.setValue(DEFAULT_REFRESH_MINUTES)
+        self.refresh_interval_spinbox.setSuffix(" min")
+        refresh_layout.addRow(self.auto_refresh_checkbox)
+        refresh_layout.addRow("Interwał:", self.refresh_interval_spinbox)
+        self.sidebar_layout.addWidget(refresh_group)
+
+        self.load_charts_button = QPushButton("Wczytaj Wykresy dla wybranej pary")
+        self.sidebar_layout.addWidget(self.load_charts_button)
+
+        self.sidebar_scroll_area.setWidget(self.sidebar_widget)
+        self.main_layout.addWidget(self.sidebar_scroll_area)
+
+        self.auto_refresh_checkbox.stateChanged.connect(self.toggle_auto_refresh)
+        self.refresh_interval_spinbox.valueChanged.connect(self.update_refresh_interval)
+        self.load_charts_button.clicked.connect(self.trigger_chart_updates)
 
         self.global_indicator_combo.currentTextChanged.connect(self.on_global_indicator_changed); self.global_indicator_combo.currentTextChanged.connect(self.save_settings)
         for spinbox in [self.wpr_period_spin, self.ema_period_spin, self.rsi_period_spin, self.macd_fast_spin, self.macd_slow_spin, self.macd_signal_spin]: spinbox.valueChanged.connect(self.save_settings)
@@ -301,6 +340,21 @@ class MultiChartWindow(QMainWindow):
             chart_widget.sigDoubleClicked.connect(lambda cw=chart_widget: self.toggle_maximize_chart(cw))
             self.charts_grid_layout.addWidget(chart_widget, i, j); self.charts.append(chart_widget)
         self.main_layout.addWidget(self.charts_area_widget, 1)
+
+    def toggle_auto_refresh(self, state):
+        if Qt.CheckState(state) == Qt.CheckState.Checked:
+            self.update_refresh_interval()
+            self.refresh_timer.start()
+            self.load_charts_button.setEnabled(False)
+            self.trigger_chart_updates()
+        else:
+            self.refresh_timer.stop()
+            self.load_charts_button.setEnabled(True)
+
+    def update_refresh_interval(self):
+        minutes = self.refresh_interval_spinbox.value()
+        interval_ms = minutes * 60 * 1000
+        self.refresh_timer.setInterval(interval_ms)
 
     def toggle_maximize_chart(self, chart_to_toggle):
         if self.maximized_chart is None:
@@ -321,18 +375,39 @@ class MultiChartWindow(QMainWindow):
         elif name == "MACD": self.params_stacked_widget.setCurrentIndex(2)
 
     def trigger_chart_updates(self):
+        if self.is_loading:
+            return
+
         current_item = self.watchlist_widget.currentItem()
-        if not current_item: QMessageBox.warning(self, "Brak wyboru", "Wybierz parę z listy obserwowanych."); return
+        if not current_item:
+            if self.auto_refresh_checkbox.isChecked():
+                return
+            else:
+                QMessageBox.warning(self, "Brak wyboru", "Wybierz parę z listy obserwowanych.")
+                return
+
+        self.is_loading = True
         self.current_pair = current_item.text()
 
-        self.load_charts_button.setEnabled(False); self.load_charts_button.setText(f"Wczytywanie {self.current_pair}...")
+        if not self.auto_refresh_checkbox.isChecked():
+            self.load_charts_button.setEnabled(False)
+            self.load_charts_button.setText(f"Wczytywanie {self.current_pair}...")
 
         self.chart_data_threads.clear()
-
         delay = 0
         for chart_widget in self.charts:
             QTimer.singleShot(delay, lambda cw=chart_widget: self.start_single_fetch_thread(cw))
             delay += 250
+
+    def on_chart_data_thread_finished(self, finished_thread=None):
+        if finished_thread and finished_thread.chart_widget.chart_id in self.chart_data_threads:
+            del self.chart_data_threads[finished_thread.chart_widget.chart_id]
+
+        if not self.chart_data_threads:
+            self.is_loading = False
+            if not self.auto_refresh_checkbox.isChecked():
+                self.load_charts_button.setEnabled(True)
+                self.load_charts_button.setText("Wczytaj Wykresy dla wybranej pary")
 
     def start_single_fetch_thread(self, chart_widget):
         exchange = self.get_exchange();
@@ -352,6 +427,7 @@ class MultiChartWindow(QMainWindow):
 
     def on_exchange_changed(self, exchange_name_gui):
         self.load_settings(); self.available_pairs_list_widget.clear(); self.trigger_fetch_markets()
+
     def trigger_fetch_markets(self):
         if self.fetch_markets_thread and self.fetch_markets_thread.isRunning(): return
         selected_exchange_gui = self.chart_exchange_combo.currentText(); selected_config = self.exchange_options.get(selected_exchange_gui)
@@ -362,33 +438,35 @@ class MultiChartWindow(QMainWindow):
         self.fetch_markets_thread.markets_fetched_signal.connect(self.populate_available_pairs)
         self.fetch_markets_thread.error_signal.connect(lambda msg: QMessageBox.critical(self, "Błąd API", msg))
         self.fetch_markets_thread.finished_signal.connect(self.on_fetch_markets_finished); self.fetch_markets_thread.start()
+
     def populate_available_pairs(self, pairs_list):
         self.available_pairs_list_widget.clear()
         watchlist_pairs = {self.watchlist_widget.item(i).text() for i in range(self.watchlist_widget.count())}
         self.available_pairs_list_widget.addItems([p for p in pairs_list if p not in watchlist_pairs])
+
     def on_fetch_markets_finished(self):
         self.refresh_pairs_button.setEnabled(True); self.refresh_pairs_button.setText("Odśwież Dostępne Pary")
+
     def add_to_watchlist(self):
         for item in self.available_pairs_list_widget.selectedItems():
             self.watchlist_widget.addItem(self.available_pairs_list_widget.takeItem(self.available_pairs_list_widget.row(item)))
         self.watchlist_widget.sortItems(); self.save_settings()
+
     def remove_from_watchlist(self):
         for item in self.watchlist_widget.selectedItems():
             self.available_pairs_list_widget.addItem(self.watchlist_widget.takeItem(self.watchlist_widget.row(item)))
         self.available_pairs_list_widget.sortItems(); self.save_settings()
+
     def add_all_to_watchlist(self):
         while self.available_pairs_list_widget.count() > 0:
             self.watchlist_widget.addItem(self.available_pairs_list_widget.takeItem(0))
         self.watchlist_widget.sortItems(); self.save_settings()
+
     def remove_all_from_watchlist(self):
         while self.watchlist_widget.count() > 0:
             self.available_pairs_list_widget.addItem(self.watchlist_widget.takeItem(0))
         self.available_pairs_list_widget.sortItems(); self.save_settings()
-    def on_chart_data_thread_finished(self, finished_thread=None):
-        if finished_thread and finished_thread.chart_widget.chart_id in self.chart_data_threads:
-            del self.chart_data_threads[finished_thread.chart_widget.chart_id]
-        if not self.chart_data_threads:
-            self.load_charts_button.setEnabled(True); self.load_charts_button.setText("Wczytaj Wykresy dla wybranej pary")
+
     def get_exchange(self):
         selected_exchange_gui = self.chart_exchange_combo.currentText(); selected_config = self.exchange_options.get(selected_exchange_gui)
         if not selected_config: return None
@@ -402,13 +480,16 @@ class MultiChartWindow(QMainWindow):
             exchange = getattr(ccxt, ccxt_id)({'apiKey': api_key, 'secret': api_secret, 'enableRateLimit': True, 'options': {'defaultType': market_type} if market_type in ['future', 'swap'] else {}})
             return exchange
         except Exception as e: QMessageBox.critical(self, "Błąd Giełdy", f"Nie można zainicjalizować {ccxt_id}: {str(e)}"); return None
+
     def get_indicator_name(self): return self.global_indicator_combo.currentText()
+
     def get_indicator_params(self):
         indicator_name = self.get_indicator_name(); params = {}
         if indicator_name == "Williams %R": params = {'wpr_period': self.wpr_period_spin.value(), 'ema_period': self.ema_period_spin.value()}
         elif indicator_name == "RSI": params = {'rsi_period': self.rsi_period_spin.value()}
         elif indicator_name == "MACD": params = {'fast': self.macd_fast_spin.value(), 'slow': self.macd_slow_spin.value(), 'signal': self.macd_signal_spin.value()}
         return params
+
     def load_settings(self):
         config = configparser.ConfigParser();
         if not os.path.exists(self.config_path):
@@ -437,6 +518,7 @@ class MultiChartWindow(QMainWindow):
             settings = config['chart_settings']
             for i, chart_widget in enumerate(self.charts):
                 tf = settings.get(f'chart_{i}_timeframe', '1h'); chart_widget.timeframe_combo.setCurrentText(tf)
+
     def save_settings(self, _=None):
         config = configparser.ConfigParser()
         if os.path.exists(self.config_path):

@@ -16,6 +16,7 @@ from PySide6.QtGui import QAction
 from PySide6.QtCore import QThread, Signal, QStandardPaths, Qt
 
 from chart_window import MultiChartWindow
+from spike_detector_window import SpikeDetectorWindow
 
 CONFIG_DIR_NAME = "KryptoSkaner"
 CONFIG_FILE_NAME = "app_settings.ini"
@@ -186,6 +187,7 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.setWindowTitle("Krypto Skaner"); self.setGeometry(100, 100, 1200, 800)
         self.chart_win = None
+        self.spike_detector_win = None
         self.setup_menu()
         self.scroll_area = QScrollArea(); self.scroll_area.setWidgetResizable(True); self.setCentralWidget(self.scroll_area)
         self.scroll_content_widget = QWidget(); self.main_overall_layout = QVBoxLayout(self.scroll_content_widget); self.scroll_area.setWidget(self.scroll_content_widget)
@@ -273,6 +275,9 @@ class MainWindow(QMainWindow):
         open_chart_action = QAction("Otwórz okno analizy wykresów", self)
         open_chart_action.triggered.connect(self.open_chart_window)
         tools_menu.addAction(open_chart_action)
+        open_spike_detector_action = QAction("Otwórz detektor pików", self)
+        open_spike_detector_action.triggered.connect(self.open_spike_detector_window)
+        tools_menu.addAction(open_spike_detector_action)
 
     def open_chart_window(self):
         if self.chart_win is None or not self.chart_win.isVisible():
@@ -280,6 +285,14 @@ class MainWindow(QMainWindow):
             self.chart_win.show()
         else:
             self.chart_win.activateWindow(); self.chart_win.raise_()
+
+    def open_spike_detector_window(self):
+        if self.spike_detector_win is None or not self.spike_detector_win.isVisible():
+            self.spike_detector_win = SpikeDetectorWindow(self.exchange_options, self)
+            self.spike_detector_win.show()
+        else:
+            self.spike_detector_win.activateWindow()
+            self.spike_detector_win.raise_()
 
     def on_exchange_selection_changed(self, exchange_name_gui):
         self.load_configuration(exchange_name_gui)
