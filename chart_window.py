@@ -1,4 +1,4 @@
-# Ostateczna, stabilna wersja pliku chart_window.py
+# Wersja z mniejszą czcionką dla danych kursora
 import sys
 import os
 import configparser
@@ -14,12 +14,14 @@ from PySide6.QtWidgets import (QMainWindow, QVBoxLayout, QWidget,
                              QPushButton, QHBoxLayout, QGroupBox, QApplication,
                              QMessageBox, QListWidgetItem, QFormLayout,
                              QSpinBox, QStackedWidget, QCheckBox, QScrollArea)
-from PySide6.QtCore import QThread, Signal, Qt, QRectF, QPointF, QTimer
-from PySide6.QtGui import QPainter, QPen
+from PySide6.QtCore import QThread, Signal, Qt, QRectF, QPointF, QTimer, QEvent
+# ZMIANA: Dodajemy QFont
+from PySide6.QtGui import QPainter, QPen, QFont
 
 pg.setConfigOption('background', 'w')
 pg.setConfigOption('foreground', 'k')
 
+# ... (wszystkie stałe i klasy do FetchThread i CandlestickItem bez zmian) ...
 DEFAULT_WPR_LENGTH = 14
 DEFAULT_EMA_WPR_LENGTH = 9
 DEFAULT_RSI_LENGTH = 14
@@ -28,19 +30,18 @@ DEFAULT_MACD_SLOW = 26
 DEFAULT_MACD_SIGNAL = 9
 DEFAULT_REFRESH_MINUTES = 5
 
-# --- STABILNA, POPRAWIONA KLASA DO RYSOWANIA ŚWIEC ---
 class CandlestickItem(pg.GraphicsObject):
     def __init__(self, data):
         pg.GraphicsObject.__init__(self)
-        self.data = data  # data = list of dicts with 'x', 'o', 'h', 'l', 'c'
+        self.data = data
         self.generatePicture()
 
     def generatePicture(self):
         self.picture = pg.QtGui.QPicture()
         p = pg.QtGui.QPainter(self.picture)
+        if not self.data: return
 
         if len(self.data) > 1:
-            # Poprawione obliczanie szerokości świecy
             w = (self.data[1]['x'] - self.data[0]['x']) * 0.4
         else:
             w = 1.0
@@ -61,13 +62,11 @@ class CandlestickItem(pg.GraphicsObject):
 
     def boundingRect(self):
         if not self.data: return QRectF()
-        # Poprawione obliczanie granic
         x_min = self.data[0]['x']
         x_max = self.data[-1]['x']
         y_min = min(d['low'] for d in self.data)
         y_max = max(d['high'] for d in self.data)
         return QRectF(x_min, y_min, x_max - x_min, y_max - y_min)
-
 
 class FetchChartMarketsThread(QThread):
     markets_fetched_signal = Signal(list); error_signal = Signal(str); finished_signal = Signal()
@@ -139,8 +138,20 @@ class SingleChartWidget(QWidget):
     def __init__(self, chart_id, parent=None):
         super().__init__(parent); self.chart_id = chart_id
         self.layout = QVBoxLayout(self); self.layout.setContentsMargins(2, 2, 2, 2); self.layout.setSpacing(2)
-        controls_layout = QHBoxLayout(); self.timeframe_combo = QComboBox(); self.timeframe_combo.addItems(['1m', '5m', '15m', '1h', '4h', '12h', '1d', '1w'])
-        controls_layout.addWidget(QLabel(f"Wykres {self.chart_id + 1} - Interwał:")); controls_layout.addWidget(self.timeframe_combo); controls_layout.addStretch()
+
+        top_layout = QHBoxLayout()
+        self.chart_title_label = QLabel(f"Wykres {self.chart_id + 1}")
+
+        # === ZMIANA: Ustawienie mniejszej czcionki ===
+        font = QFont()
+        font.setPointSize(9) # Domyślny rozmiar to ok. 10-11
+        self.chart_title_label.setFont(font)
+
+        self.timeframe_combo = QComboBox(); self.timeframe_combo.addItems(['1m', '5m', '15m', '1h', '4h', '12h', '1d', '1w'])
+        top_layout.addWidget(self.chart_title_label)
+        top_layout.addStretch()
+        top_layout.addWidget(QLabel("Interwał:"))
+        top_layout.addWidget(self.timeframe_combo)
 
         self.plot_item_price = MeasurablePlotItem(axisItems={'bottom': pg.DateAxisItem()})
         self.plot_widget = pg.PlotWidget(plotItem=self.plot_item_price)
@@ -148,9 +159,10 @@ class SingleChartWidget(QWidget):
         self.indicator_widget = pg.PlotWidget(plotItem=self.indicator_plot_item)
         self.indicator_plot_item.setXLink(self.plot_item_price)
 
-        self.layout.addLayout(controls_layout); self.layout.addWidget(self.plot_widget); self.layout.addWidget(self.indicator_widget)
+        self.layout.addLayout(top_layout); self.layout.addWidget(self.plot_widget); self.layout.addWidget(self.indicator_widget)
         self.layout.setStretchFactor(self.plot_widget, 3); self.layout.setStretchFactor(self.indicator_widget, 1)
         self.data_frame = None; self.current_indicator_name = ""
+        self.pair_name = ""
 
         pen = pg.mkPen(color=(100, 100, 100), style=Qt.DashLine)
         self.v_line = pg.InfiniteLine(angle=90, movable=False, pen=pen); self.h_line = pg.InfiniteLine(angle=0, movable=False, pen=pen)
@@ -161,22 +173,45 @@ class SingleChartWidget(QWidget):
         self.price_mouse_proxy = pg.SignalProxy(self.plot_widget.scene().sigMouseMoved, rateLimit=60, slot=self.mouse_moved)
         self.indicator_mouse_proxy = pg.SignalProxy(self.indicator_widget.scene().sigMouseMoved, rateLimit=60, slot=self.mouse_moved)
 
+        self.plot_widget.scene().installEventFilter(self)
+        self.indicator_widget.scene().installEventFilter(self)
+
         self.measure_line = pg.PlotDataItem(pen=pg.mkPen(color='blue', style=Qt.DashLine, width=2))
         self.measure_text = pg.TextItem(anchor=(0, 1), color=(0,0,200), fill=(255, 255, 255, 180))
         self.plot_widget.addItem(self.measure_line); self.plot_widget.addItem(self.measure_text); self.measure_text.setVisible(False)
         self.plot_item_price.sigMeasureStart.connect(self.measure_start); self.plot_item_price.sigMeasureUpdate.connect(self.measure_update); self.plot_item_price.sigMeasureEnd.connect(self.measure_end)
+
+    def eventFilter(self, watched_object, event):
+        if event.type() == QEvent.Type.Leave:
+            if watched_object is self.plot_widget.scene() or watched_object is self.indicator_widget.scene():
+                self.mouse_left()
+        return super().eventFilter(watched_object, event)
+
     def mouseDoubleClickEvent(self, event): self.sigDoubleClicked.emit(); super().mouseDoubleClickEvent(event)
+
     def mouse_moved(self, event):
         pos = event[0]
-        if self.plot_widget.sceneBoundingRect().contains(pos):
+        if self.plot_widget.sceneBoundingRect().contains(pos) or self.indicator_widget.sceneBoundingRect().contains(pos):
             mouse_point = self.plot_widget.getPlotItem().vb.mapSceneToView(pos)
-            self.h_line.setPos(mouse_point.y()); self.h_line.show()
-            self.mouse_moved_signal.emit(mouse_point.x())
-        elif self.indicator_widget.sceneBoundingRect().contains(pos):
-            mouse_point = self.indicator_widget.getPlotItem().vb.mapSceneToView(pos)
-            self.h_line.hide(); self.mouse_moved_signal.emit(mouse_point.x())
+            x_val, y_val = mouse_point.x(), mouse_point.y()
+
+            self.h_line.setPos(y_val)
+            self.h_line.show()
+            self.mouse_moved_signal.emit(x_val)
+
+            date_str = datetime.datetime.fromtimestamp(x_val).strftime('%Y-%m-%d %H:%M:%S')
+            self.chart_title_label.setText(f"<b>{self.pair_name}</b> | Data: {date_str} | Cena: {y_val:.4f}")
+
+    def mouse_left(self):
+        self.h_line.hide()
+        self.v_line.hide()
+        self.v_line_indicator.hide()
+        self.chart_title_label.setText(f"<b>{self.pair_name}</b>")
+
     def update_v_line(self, x_pos):
-        self.v_line.setPos(x_pos); self.v_line_indicator.setPos(x_pos)
+        self.v_line.setPos(x_pos); self.v_line.show()
+        self.v_line_indicator.setPos(x_pos); self.v_line_indicator.show()
+
     def get_snapped_pos(self, pos):
         if self.data_frame is None or self.data_frame.empty: return pos
         try:
@@ -209,9 +244,13 @@ class SingleChartWidget(QWidget):
         self.measure_text.setText(text); self.measure_text.setPos(snapped_pos)
     def measure_end(self, pos):
         self.start_measure_pos = None; self.measure_line.setData([], []); self.measure_text.setVisible(False)
-    def update_chart_and_indicator(self, df, indicator_name):
+
+    def update_chart_and_indicator(self, df, indicator_name, pair_name):
         self.data_frame = df; self.current_indicator_name = indicator_name
-        self.plot_widget.clear(); self.indicator_widget.clear(); self.plot_widget.setTitle("")
+        self.pair_name = pair_name
+        self.chart_title_label.setText(f"<b>{self.pair_name}</b>")
+
+        self.plot_widget.clear(); self.indicator_widget.clear()
         self.plot_widget.addItem(self.v_line, ignoreBounds=True); self.plot_widget.addItem(self.h_line, ignoreBounds=True)
         self.indicator_widget.addItem(self.v_line_indicator, ignoreBounds=True)
         self.plot_widget.addItem(self.measure_line); self.plot_widget.addItem(self.measure_text)
@@ -219,14 +258,14 @@ class SingleChartWidget(QWidget):
         if not df.empty:
             candlestick_data = []
             for d_idx, row in df.iterrows():
-                # Przekształcanie timestampu na sekundy
                 timestamp = d_idx.timestamp()
                 candlestick_data.append({'x': timestamp, 'open': row['open'], 'high': row['high'], 'low': row['low'], 'close': row['close']})
-
             item = CandlestickItem(candlestick_data)
             self.plot_widget.addItem(item)
 
         self.redraw_indicator(); self.plot_widget.autoRange(); self.indicator_widget.autoRange()
+        self.mouse_left()
+
     def redraw_indicator(self):
         self.indicator_widget.clear(); self.indicator_widget.addItem(self.v_line_indicator, ignoreBounds=True)
         if self.data_frame is None or self.data_frame.empty: return
@@ -418,8 +457,8 @@ class MultiChartWindow(QMainWindow):
 
         thread = FetchChartDataThread(exchange, self.current_pair, chart_widget.timeframe_combo.currentText(), indicator_name, indicator_params, chart_widget, self)
 
-        thread.data_ready_signal.connect(lambda df, cw, ind=indicator_name: cw.update_chart_and_indicator(df, ind))
-        thread.error_signal.connect(lambda msg, cw=chart_widget: cw.plot_widget.setTitle(f"Błąd: {msg}", color='r'))
+        thread.data_ready_signal.connect(lambda df, cw, ind=indicator_name, p=self.current_pair: cw.update_chart_and_indicator(df, ind, p))
+        thread.error_signal.connect(lambda msg, cw=chart_widget: cw.chart_title_label.setText(f"Błąd: {msg}"))
         thread.finished.connect(lambda th=thread: self.on_chart_data_thread_finished(th))
 
         self.chart_data_threads[chart_widget.chart_id] = thread
@@ -453,7 +492,7 @@ class MultiChartWindow(QMainWindow):
         self.watchlist_widget.sortItems(); self.save_settings()
 
     def remove_from_watchlist(self):
-        for item in self.watchlist_widget.selectedItems():
+        for item in self.available_pairs_list_widget.selectedItems():
             self.available_pairs_list_widget.addItem(self.watchlist_widget.takeItem(self.watchlist_widget.row(item)))
         self.available_pairs_list_widget.sortItems(); self.save_settings()
 
