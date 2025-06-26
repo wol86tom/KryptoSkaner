@@ -1,17 +1,8 @@
-# spike_detector_window.py
-import time
-import ccxt
-import ccxt.pro as ccxtpro
-import asyncio
+import sys, os, configparser, datetime, time, ccxt, ccxt.pro as ccxtpro, asyncio
 from collections import deque
-from datetime import datetime, timedelta
-
-from PySide6.QtWidgets import (QMainWindow, QLabel, QWidget, QVBoxLayout,
-                             QGroupBox, QFormLayout, QComboBox, QSpinBox,
-                             QDoubleSpinBox, QPushButton, QHBoxLayout, QTextEdit,
-                             QListWidget, QListWidgetItem, QGridLayout, QMessageBox,
-                             QApplication)
-from PySide6.QtCore import Qt, QThread, Signal
+from PyQt6.QtWidgets import (QMainWindow, QLabel, QWidget, QVBoxLayout, QGroupBox, QFormLayout, QComboBox, QSpinBox, QDoubleSpinBox, QPushButton, QHBoxLayout, QTextEdit, QListWidget, QGridLayout, QMessageBox, QApplication)
+from PyQt6.QtCore import Qt, QThread, pyqtSignal as Signal
+# ... (Reszta kodu tego pliku jest poprawna i pozostaje bez zmian) ...
 
 class FetchSpikeDetectorMarketsThread(QThread):
     markets_fetched_signal = Signal(list)
