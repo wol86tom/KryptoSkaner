@@ -387,7 +387,7 @@ class SingleChartWidget(QWidget):
                 self.indicator_widget.addItem(pg.BarGraphItem(x=timestamps, height=self.data_frame[macdh_col], width=width, brushes=brushes))
         self.indicator_widget.autoRange()
 
-class MultiChartWindow(QMainWindow):
+class ChartWindow(QMainWindow):
     def __init__(self, exchange_options, config_path, parent=None):
         super().__init__(parent)
         self.exchange_options = exchange_options
