@@ -51,18 +51,16 @@ class CandlestickItem(pg.GraphicsObject):
             t, o, h, l, c = d['x'], d['open'], d['high'], d['low'], d['close']
 
             p.setPen(pg.mkPen('k', width=1))
-            p.drawLine(QPointF(t, l), QPointF(t, h))
+            if h > max(o, c):
+                p.drawLine(QPointF(t, h), QPointF(t, max(o, c)))
+            if l < min(o, c):
+                p.drawLine(QPointF(t, l), QPointF(t, min(o, c)))
 
-            if o != c:
-                p.setBrush(pg.mkBrush('g' if c > o else 'r'))
-                p.setPen(pg.mkPen('k', width=1))
-
-                body_top = min(o, c)
-                body_height = abs(o - c)
-                p.drawRect(QRectF(t - w, body_top, w * 2, body_height))
-            else:
-                p.setPen(pg.mkPen('k', width=1))
+            if o == c:
                 p.drawLine(QPointF(t - w, o), QPointF(t + w, c))
+            else:
+                p.setBrush(pg.mkBrush('g' if c > o else 'r'))
+                p.drawRect(QRectF(t - w, o, w * 2, c - o))
         p.end()
 
     def paint(self, p, *args):
@@ -70,9 +68,11 @@ class CandlestickItem(pg.GraphicsObject):
 
     def boundingRect(self):
         if not self.data: return QRectF()
+        interval_seconds = self.data[0].get('interval_seconds', 1)
+        w = interval_seconds * 0.4
         x_min = min(d['x'] for d in self.data); x_max = max(d['x'] for d in self.data)
         y_min = np.min([d['low'] for d in self.data]); y_max = np.max([d['high'] for d in self.data])
-        return QRectF(x_min, y_min, x_max - x_min, y_max - y_min).normalized()
+        return QRectF(x_min - w, y_min, (x_max - x_min) + (2 * w), y_max - y_min).normalized()
 
 
 class AsyncioWorker(Thread):
@@ -85,32 +85,33 @@ class AsyncioWorker(Thread):
         self.data_queue = data_queue
         self._is_running = False
         self.loop = None
+        self.exchange = None
+        self.tasks = []
 
     def run(self):
         self._is_running = True
         try:
             self.loop = asyncio.new_event_loop()
             asyncio.set_event_loop(self.loop)
-            self.loop.create_task(self.main_loop())
-            self.loop.run_forever()
+            self.loop.run_until_complete(self.main_task_wrapper())
         except Exception as e:
             if self._is_running:
-                self.data_queue.put({'error': str(e)})
-        finally:
-            if self.loop and self.loop.is_running():
-                self.loop.stop()
-            if self.loop:
-                self.loop.close()
+                self.data_queue.put({'error': f"Błąd pętli głównej wątku: {e}"})
 
-    async def main_loop(self):
+    async def main_task_wrapper(self):
         exchange_config = {'options': {'defaultType': self.market_type}}
-        exchange = getattr(ccxtpro, self.exchange_id)(exchange_config)
-        tasks = [
-            self.watch_trades_loop(exchange, self.pair_symbol),
-            self.watch_orderbook_loop(exchange, self.pair_symbol)
-        ]
-        await asyncio.gather(*tasks)
-        await exchange.close()
+        self.exchange = getattr(ccxtpro, self.exchange_id)(exchange_config)
+        try:
+            self.tasks = [
+                self.watch_trades_loop(self.exchange, self.pair_symbol),
+                self.watch_orderbook_loop(self.exchange, self.pair_symbol)
+            ]
+            await asyncio.gather(*self.tasks)
+        except asyncio.CancelledError:
+            pass # Oczekiwane przy zamykaniu
+        finally:
+            if self.exchange.clients:
+                await self.exchange.close()
 
     async def watch_trades_loop(self, exchange, symbol):
         while self._is_running:
@@ -130,6 +131,9 @@ class AsyncioWorker(Thread):
 
     def stop(self):
         self._is_running = False
+        if self.tasks:
+            for task in self.tasks:
+                task.cancel()
         if self.loop:
             self.loop.call_soon_threadsafe(self.loop.stop)
 
@@ -249,10 +253,7 @@ class OrderFlowWindow(QMainWindow):
         self.redraw_plots(); self.save_settings()
 
     def on_exchange_changed(self):
-        self.save_settings()
-        self.watchlist.clear()
-        self.available_pairs_list.clear()
-        self.trigger_fetch_markets()
+        self.save_settings(); self.watchlist.clear(); self.available_pairs_list.clear(); self.trigger_fetch_markets()
 
     def set_controls_enabled(self, enabled):
         for w in [self.exchange_combo, self.resample_combo, self.num_candles_spinbox, self.delta_mode_combo, self.aggregation_combo, self.ob_source_combo, self.available_pairs_list, self.watchlist]:
@@ -263,13 +264,8 @@ class OrderFlowWindow(QMainWindow):
         if self.active_workers: QMessageBox.warning(self, "Stream aktywny", "Stream już działa."); return
         current_item = self.watchlist.currentItem()
         if not current_item: QMessageBox.warning(self, "Brak pary", "Wybierz parę z listy obserwowanych."); return
-
-        self.save_settings()
-        market_data = current_item.data(Qt.ItemDataRole.UserRole)
-        pair_symbol = market_data['symbol']
-
+        self.save_settings(); market_data = current_item.data(Qt.ItemDataRole.UserRole); pair_symbol = market_data['symbol']
         self.reset_data_structures(); self.redraw_plots()
-
         selected_exchange_name = self.exchange_combo.currentText()
         if self.ob_source_combo.currentText() == "Wybrana giełda":
             exchange_id = self.exchange_options[selected_exchange_name]['id_ccxt']; market_type = self.exchange_options[selected_exchange_name]['type']
@@ -278,7 +274,6 @@ class OrderFlowWindow(QMainWindow):
             for ex_name, ex_data in self.exchange_options.items():
                 if ex_data['id_ccxt'] in ['binance', 'binanceusdm', 'bybit']:
                     worker = AsyncioWorker(ex_data['id_ccxt'], pair_symbol, ex_data['type'], self.data_queue); self.active_workers[ex_data['id_ccxt']] = worker; worker.start()
-
         if not self.active_workers: QMessageBox.warning(self, "Brak streamów", "Brak wspieranych giełd do streamowania."); return
         self.update_timer.start(200); self.set_controls_enabled(False)
 
@@ -288,16 +283,15 @@ class OrderFlowWindow(QMainWindow):
         self.active_workers.clear(); self.update_timer.stop(); self.set_controls_enabled(True)
 
     def process_queue(self):
-        processed_count = 0
+        processed_count = 0; has_trades = False
         while not self.data_queue.empty() and processed_count < 200:
             try: data = self.data_queue.get_nowait()
             except Exception: break
             processed_count += 1
-            if 'trades' in data: self.process_trades(data['trades'])
+            if 'trades' in data: self.process_trades(data['trades']); has_trades = True
             if 'orderbook' in data: self.current_order_books[data['exchange_id']] = data['orderbook']; self.aggregate_and_update_display()
             if 'error' in data: QMessageBox.critical(self, "Błąd Streamu", data['error']); self.stop_stream()
-
-        if processed_count > 0 and time.time() - self.last_plot_update_time >= self.plot_update_interval_ms / 1000.0:
+        if has_trades and time.time() - self.last_plot_update_time >= self.plot_update_interval_ms / 1000.0:
             self.redraw_plots(); self.last_plot_update_time = time.time()
 
     def process_trades(self, trades):
@@ -314,32 +308,26 @@ class OrderFlowWindow(QMainWindow):
                 self.current_candle.update({'high': max(self.current_candle['high'], price), 'low': min(self.current_candle['low'], price), 'close': price, 'delta': self.current_candle['delta'] + (amount if trade['side'] == 'buy' else -amount)})
 
     def aggregate_and_update_display(self):
-        agg_level_str = self.aggregation_combo.currentText(); agg_level = 0.0 if agg_level_str == "Brak" else float(agg_level_str)
-        bids_map, asks_map = {}, {}
+        agg_level_str = self.aggregation_combo.currentText(); agg_level = 0.0 if agg_level_str == "Brak" else float(agg_level_str); bids_map, asks_map = {}, {}
         for ex_id, book in self.current_order_books.items():
             for price, amount in book.get('bids', []):
                 agg_price = round(np.floor(price / agg_level) * agg_level, self.get_price_precision()) if agg_level > 0 else price
-                if agg_price not in bids_map: bids_map[agg_price] = {'amount': 0, 'exchanges': {}}
-                bids_map[agg_price]['amount'] += amount; bids_map[agg_price]['exchanges'][ex_id] = bids_map[agg_price]['exchanges'].get(ex_id, 0) + amount
+                if agg_price not in bids_map: bids_map[agg_price] = {'amount': 0, 'exchanges': {}}; bids_map[agg_price]['amount'] += amount; bids_map[agg_price]['exchanges'][ex_id] = bids_map[agg_price]['exchanges'].get(ex_id, 0) + amount
             for price, amount in book.get('asks', []):
                 agg_price = round(np.ceil(price / agg_level) * agg_level, self.get_price_precision()) if agg_level > 0 else price
-                if agg_price not in asks_map: asks_map[agg_price] = {'amount': 0, 'exchanges': {}}
-                asks_map[agg_price]['amount'] += amount; asks_map[agg_price]['exchanges'][ex_id] = asks_map[agg_price]['exchanges'].get(ex_id, 0) + amount
-
+                if agg_price not in asks_map: asks_map[agg_price] = {'amount': 0, 'exchanges': {}}; asks_map[agg_price]['amount'] += amount; asks_map[agg_price]['exchanges'][ex_id] = asks_map[agg_price]['exchanges'].get(ex_id, 0) + amount
         bids_data = sorted([(v['amount'], k, k * v['amount'], max(v['exchanges'], key=v['exchanges'].get)) for k, v in bids_map.items()], key=lambda x: x[1], reverse=True)
         asks_data = sorted([(v['amount'], k, k * v['amount'], max(v['exchanges'], key=v['exchanges'].get)) for k, v in asks_map.items()], key=lambda x: x[1])
         self.update_book_table(self.bids_table, bids_data); self.update_book_table(self.asks_table, asks_data)
 
     def update_book_table(self, table, data):
-        table.setSortingEnabled(False); max_rows = table.rowCount()
-        visible_data = data[:max_rows]; max_val = max(row[2] for row in visible_data) if visible_data else 1.0; prec = self.get_price_precision()
+        table.setSortingEnabled(False); max_rows = table.rowCount(); visible_data = data[:max_rows]; max_val = max(row[2] for row in visible_data) if visible_data else 1.0; prec = self.get_price_precision()
         for i in range(max_rows):
             if i < len(visible_data):
                 amount, price, value, ex_id = visible_data[i]
                 items = [QTableWidgetItem(f"{amount:.4f}"), QTableWidgetItem(f"{price:.{prec}f}"), QTableWidgetItem(f"{value:,.2f}"), QTableWidgetItem(ex_id)]
-                base_color = QColor(250, 250, 250); strong_color = QColor(255, 160, 160) if table is self.asks_table else QColor(160, 255, 160)
-                strength = min((value / max_val), 1.0)
-                r = int(base_color.red() * (1 - strength) + strong_color.red() * strength); g = int(base_color.green() * (1 - strength) + strong_color.green() * strength); b = int(base_color.blue() * (1 - strength) + strong_color.blue() * strength)
+                base_color = QColor(250,250,250); strong_color = QColor(255,160,160) if table is self.asks_table else QColor(160,255,160); strength = min((value / max_val), 1.0)
+                r = int(base_color.red()*(1-strength)+strong_color.red()*strength); g = int(base_color.green()*(1-strength)+strong_color.green()*strength); b = int(base_color.blue()*(1-strength)+strong_color.blue()*strength)
                 bg_color = QColor(r,g,b)
                 for j, item in enumerate(items):
                     item.setFont(self.table_font); item.setBackground(bg_color); table.setItem(i, j, item)
@@ -354,12 +342,10 @@ class OrderFlowWindow(QMainWindow):
             return
 
         self.candlestick_item.setData(full_candle_data)
-
         x_data = np.array([d['x'] for d in full_candle_data])
         num_candles_to_show = self.num_candles_spinbox.value()
         interval_seconds = self.RESAMPLE_MAP.get(self.resample_combo.currentText(), 1)
         visible_range_seconds = num_candles_to_show * interval_seconds
-
         x_max_current = x_data[-1]
         x_min_current = x_max_current - visible_range_seconds
 
@@ -392,13 +378,7 @@ class OrderFlowWindow(QMainWindow):
         self.exchange_combo.setEnabled(True)
 
     def populate_available_pairs(self, markets):
-        self.available_pairs_list.clear()
-        for market in markets:
-            item = QListWidgetItem(market['symbol'])
-            item.setData(Qt.ItemDataRole.UserRole, market)
-            self.available_pairs_list.addItem(item)
-
-        # Po załadowaniu par, odtwórz watchlistę
+        self.available_pairs_list.clear(); [self.available_pairs_list.addItem(self.create_list_item(m)) for m in markets]
         self._apply_pending_watchlist()
 
     def add_to_watchlist(self):
@@ -416,49 +396,48 @@ class OrderFlowWindow(QMainWindow):
         item = QListWidgetItem(market_data['symbol']); item.setData(Qt.ItemDataRole.UserRole, market_data); return item
 
     def load_settings(self):
-        self.config.read(self.config_path)
-        if not self.config.has_section("order_flow_settings"):
-            self.trigger_fetch_markets(); return
+        try:
+            self.config.read(self.config_path)
+            if not self.config.has_section("order_flow_settings"):
+                self.trigger_fetch_markets(); return
 
-        s = self.config["order_flow_settings"]
+            s = self.config["order_flow_settings"]
 
-        # Zablokuj sygnały, aby uniknąć wielokrotnego zapisywania podczas wczytywania
-        for widget in [self.exchange_combo, self.resample_combo, self.num_candles_spinbox, self.delta_mode_combo, self.aggregation_combo, self.ob_source_combo]:
-            widget.blockSignals(True)
+            widgets_to_block = [self.exchange_combo, self.resample_combo, self.num_candles_spinbox, self.delta_mode_combo, self.aggregation_combo, self.ob_source_combo]
+            for w in widgets_to_block: w.blockSignals(True)
 
-        self.exchange_combo.setCurrentText(s.get("exchange", self.exchange_combo.itemText(0)))
-        self.resample_combo.setCurrentText(s.get("resample_interval", "1s"))
-        self.num_candles_spinbox.setValue(s.getint("num_candles", 100))
-        self.delta_mode_combo.setCurrentText(s.get("delta_mode", "CVD (Skumulowana Delta)"))
-        self.aggregation_combo.setCurrentText(s.get("aggregation", "Brak"))
-        self.ob_source_combo.setCurrentText(s.get("ob_source", "Wybrana giełda"))
+            self.exchange_combo.setCurrentText(s.get("exchange", self.exchange_combo.itemText(0)))
+            self.resample_combo.setCurrentText(s.get("resample_interval", "1s"))
+            self.num_candles_spinbox.setValue(s.getint("num_candles", 100))
+            self.delta_mode_combo.setCurrentText(s.get("delta_mode", "CVD (Skumulowana Delta)"))
+            self.aggregation_combo.setCurrentText(s.get("aggregation", "Brak"))
+            self.ob_source_combo.setCurrentText(s.get("ob_source", "Wybrana giełda"))
 
-        self.pending_watchlist_symbols = {p.strip() for p in s.get("watchlist", "").split(',') if p.strip()}
-        self.pending_selected_pair = s.get("last_selected_pair", None)
+            for w in widgets_to_block: w.blockSignals(False)
 
-        for widget in [self.exchange_combo, self.resample_combo, self.num_candles_spinbox, self.delta_mode_combo, self.aggregation_combo, self.ob_source_combo]:
-            widget.blockSignals(False)
+            self.pending_watchlist_symbols = {p.strip() for p in s.get("watchlist", "").split(',') if p.strip()}
+            self.pending_selected_pair = s.get("last_selected_pair", None)
 
-        self.trigger_fetch_markets()
-        self.watchlist.model().rowsInserted.connect(self.save_settings)
-        self.watchlist.model().rowsRemoved.connect(self.save_settings)
+            self.trigger_fetch_markets()
+            self.watchlist.model().rowsInserted.connect(self.save_settings)
+            self.watchlist.model().rowsRemoved.connect(self.save_settings)
+
+        except Exception as e:
+            print(f"Błąd wczytywania ustawień: {e}")
+            self.trigger_fetch_markets()
 
     def _apply_pending_watchlist(self):
         if not self.pending_watchlist_symbols: return
-
         available_map = {self.available_pairs_list.item(i).text(): self.available_pairs_list.item(i) for i in range(self.available_pairs_list.count())}
-
         for symbol in self.pending_watchlist_symbols:
             if symbol in available_map:
-                item_data = available_map[symbol].data(Qt.ItemDataRole.UserRole)
-                self.watchlist.addItem(self.create_list_item(item_data))
+                if not self.watchlist.findItems(symbol, Qt.MatchFlag.MatchExactly):
+                    self.watchlist.addItem(self.create_list_item(available_map[symbol].data(Qt.ItemDataRole.UserRole)))
 
         if self.pending_selected_pair:
             items = self.watchlist.findItems(self.pending_selected_pair, Qt.MatchFlag.MatchExactly)
             if items: self.watchlist.setCurrentItem(items[0])
-
-        self.pending_watchlist_symbols.clear()
-        self.pending_selected_pair = None
+        self.pending_watchlist_symbols.clear(); self.pending_selected_pair = None
 
     def save_settings(self):
         if not self.config.has_section("order_flow_settings"):
